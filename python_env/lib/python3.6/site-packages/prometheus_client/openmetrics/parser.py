@@ -4,7 +4,9 @@ from __future__ import unicode_literals
 
 import math
 
-from .. import core
+from ..metrics_core import Metric, METRIC_LABEL_NAME_RE
+from ..samples import Exemplar, Sample, Timestamp
+from ..utils import floatToGoString
 
 try:
     import StringIO
@@ -68,12 +70,12 @@ def _parse_timestamp(timestamp):
         raise ValueError("Invalid timestamp: {0!r}".format(timestamp))
     try:
         # Simple int.
-        return core.Timestamp(int(timestamp), 0)
+        return Timestamp(int(timestamp), 0)
     except ValueError:
         try:
             # aaaa.bbbb. Nanosecond resolution supported.
             parts = timestamp.split('.', 1)
-            return core.Timestamp(int(parts[0]), int(parts[1][:9].ljust(9, "0")))
+            return Timestamp(int(parts[0]), int(parts[1][:9].ljust(9, "0")))
         except ValueError:
             # Float.
             ts = float(timestamp)
@@ -110,7 +112,7 @@ def _parse_labels(it, text):
             if char == '\\':
                 state = 'labelvalueslash'
             elif char == '"':
-                if not core._METRIC_LABEL_NAME_RE.match(''.join(labelname)):
+                if not METRIC_LABEL_NAME_RE.match(''.join(labelname)):
                     raise ValueError("Invalid line: " + text)
                 labels[''.join(labelname)] = ''.join(labelvalue)
                 labelname = []
@@ -224,13 +226,13 @@ def _parse_sample(text):
         exemplar_length = sum([len(k) + len(v) + 3 for k, v in exemplar_labels.items()]) + 2
         if exemplar_length > 64:
             raise ValueError("Exmplar labels are too long: " + text)
-        exemplar = core.Exemplar(
+        exemplar = Exemplar(
             exemplar_labels,
             _parse_value(exemplar_value),
             _parse_timestamp(exemplar_timestamp),
         )
 
-    return core.Sample(''.join(name), labels, val, ts, exemplar)
+    return Sample(''.join(name), labels, val, ts, exemplar)
 
 
 def _group_for_sample(sample, name, typ):
@@ -295,7 +297,7 @@ def text_fd_to_metric_families(fd):
     so successful parsing does not imply that the parsed
     text meets the specification.
 
-    Yields core.Metric's.
+    Yields Metric's.
     """
     name = None
     allowed_names = []
@@ -319,7 +321,7 @@ def text_fd_to_metric_families(fd):
             raise ValueError("Units not allowed for this metric type: " + name)
         if typ in ['histogram', 'gaugehistogram']:
             _check_histogram(samples, name)
-        metric = core.Metric(name, documentation, typ, unit)
+        metric = Metric(name, documentation, typ, unit)
         # TODO: check labelvalues are valid utf8
         metric.samples = samples
         return metric
@@ -370,7 +372,7 @@ def text_fd_to_metric_families(fd):
                 allowed_names = {
                     'counter': ['_total', '_created'],
                     'summary': ['_count', '_sum', '', '_created'],
-                    'histogram': ['_count', '_sum', '_bucket', 'created'],
+                    'histogram': ['_count', '_sum', '_bucket', '_created'],
                     'gaugehistogram': ['_gcount', '_gsum', '_bucket'],
                     'info': ['_info'],
                 }.get(typ, [''])
@@ -401,10 +403,12 @@ def text_fd_to_metric_families(fd):
             if typ == 'stateset' and name not in sample.labels:
                 raise ValueError("Stateset missing label: " + line)
             if (typ in ['histogram', 'gaugehistogram'] and name + '_bucket' == sample.name
-                    and float(sample.labels.get('le', -1)) < 0):
+                    and (float(sample.labels.get('le', -1)) < 0
+                         or sample.labels['le'] != floatToGoString(sample.labels['le']))):
                 raise ValueError("Invalid le label: " + line)
             if (typ == 'summary' and name == sample.name
-                    and not (0 <= float(sample.labels.get('quantile', -1)) <= 1)):
+                    and (not (0 <= float(sample.labels.get('quantile', -1)) <= 1)
+                         or sample.labels['quantile'] != floatToGoString(sample.labels['quantile']))):
                 raise ValueError("Invalid quantile label: " + line)
 
             g = tuple(sorted(_group_for_sample(sample, name, typ).items()))
@@ -432,8 +436,12 @@ def text_fd_to_metric_families(fd):
                 raise ValueError("Stateset samples can only have values zero and one: " + line)
             if typ == 'info' and sample.value != 1:
                 raise ValueError("Info samples can only have value one: " + line)
-            if sample.name[len(name):] in ['_total', '_sum', '_count', '_bucket'] and math.isnan(sample.value):
+            if typ == 'summary' and name == sample.name and sample.value < 0:
+                raise ValueError("Quantile values cannot be negative: " + line)
+            if sample.name[len(name):] in ['_total', '_sum', '_count', '_bucket', '_gcount', '_gsum'] and math.isnan(sample.value):
                 raise ValueError("Counter-like samples cannot be NaN: " + line)
+            if sample.name[len(name):] in ['_total', '_sum', '_count', '_bucket', '_gcount', '_gsum'] and sample.value < 0:
+                raise ValueError("Counter-like samples cannot be negative: " + line)
             if sample.exemplar and not (
                     typ in ['histogram', 'gaugehistogram']
                     and sample.name.endswith('_bucket')):

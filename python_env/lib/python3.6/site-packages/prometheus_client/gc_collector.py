@@ -6,13 +6,14 @@ import gc
 import os
 import time
 
-from . import core
+from .metrics import Histogram
+from .registry import REGISTRY
 
 
 class GCCollector(object):
     """Collector for Garbage collection statistics."""
 
-    def __init__(self, registry=core.REGISTRY, gc=gc):
+    def __init__(self, registry=REGISTRY, gc=gc):
         # To work around the deadlock issue described in
         # https://github.com/prometheus/client_python/issues/322,
         # the GC collector is always disabled in multiprocess mode.
@@ -22,7 +23,7 @@ class GCCollector(object):
         if not hasattr(gc, 'callbacks'):
             return
 
-        collected = core.Histogram(
+        collected = Histogram(
             'python_gc_collected_objects',
             'Objects collected during gc',
             ['generation'],
@@ -30,7 +31,7 @@ class GCCollector(object):
             registry=registry
         )
 
-        uncollectable = core.Histogram(
+        uncollectable = Histogram(
             'python_gc_uncollectable_objects',
             'Uncollectable object found during GC',
             ['generation'],
@@ -38,7 +39,7 @@ class GCCollector(object):
             registry=registry
         )
 
-        latency = core.Histogram(
+        latency = Histogram(
             'python_gc_duration_seconds',
             'Time spent in garbage collection',
             ['generation'],
@@ -47,19 +48,32 @@ class GCCollector(object):
 
         times = {}
 
+        # Avoid _cb() being called re-entrantly
+        # by setting this flag and clearing it once
+        # the callback operation is complete.
+        # See https://github.com/prometheus/client_python/issues/322#issuecomment-438021132
+        self.gc_cb_active = False
+
         def _cb(phase, info):
-            gen = info['generation']
+            try:
+                if self.gc_cb_active:
+                    return
+                self.gc_cb_active = True
 
-            if phase == 'start':
-                times[gen] = time.time()
+                gen = info['generation']
 
-            if phase == 'stop':
-                delta = time.time() - times[gen]
-                latency.labels(gen).observe(delta)
-                if 'collected' in info:
-                    collected.labels(gen).observe(info['collected'])
-                if 'uncollectable' in info:
-                    uncollectable.labels(gen).observe(info['uncollectable'])
+                if phase == 'start':
+                    times[gen] = time.time()
+
+                if phase == 'stop':
+                    delta = time.time() - times[gen]
+                    latency.labels(gen).observe(delta)
+                    if 'collected' in info:
+                        collected.labels(gen).observe(info['collected'])
+                    if 'uncollectable' in info:
+                        uncollectable.labels(gen).observe(info['uncollectable'])
+            finally:
+                self.gc_cb_active = False
 
         gc.callbacks.append(_cb)
 
